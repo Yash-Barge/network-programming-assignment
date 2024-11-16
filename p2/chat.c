@@ -3,7 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <sys/_types/_fd_def.h>
+#include <fcntl.h>
+#include <sys/errno.h>
 #include <sys/ipc.h>
 #include <sys/signal.h>
 #include <unistd.h>
@@ -16,8 +17,8 @@
 #include <errno.h>
 
 #define IDLE_CHILDREN 5
+#define CLIENTS_PER_PROCESS 3
 
-#define MAX_POOL_SIZE 1024
 #define TCP_BACKLOG_LEN 5
 #define TCP_LISTENING_PORT 12345
 
@@ -38,6 +39,18 @@ struct shared_mem *shm;
 void error_and_exit(char *err_msg) {
     perror(err_msg);
     exit(EXIT_FAILURE);
+}
+
+int assemble_fdset(fd_set *fdset, int *fdarr, int len) {
+    FD_ZERO(fdset);
+    int max_fd = fdarr[0];
+
+    for (int i = 0; i < len; i++) {
+        FD_SET(fdarr[i], fdset);
+        max_fd = max_fd > fdarr[i] ? max_fd : fdarr[i];
+    }
+
+    return max_fd + 1;
 }
 
 void send_fd(int socket_fd, int payload_fd) {
@@ -70,7 +83,7 @@ int recv_fd(int socket_fd) {
     struct msghdr msg = { .msg_iov = &io, .msg_iovlen = 1, .msg_control = c_buffer, .msg_controllen = sizeof(c_buffer) };
 
     if (recvmsg(socket_fd, &msg, 0) < 0)
-        ; // error
+        return -1; // error
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     unsigned char *data = CMSG_DATA(cmsg);
@@ -79,38 +92,71 @@ int recv_fd(int socket_fd) {
     return recvd_fd;
 }
 
-void execute_child(int mq_id[2], int c_sock_fd) {
-    bool continue_execution = true;
+void execute_child(int c_sock_fd) {
+    bool continue_execution = true, is_active = false;
+    int connections[CLIENTS_PER_PROCESS] = { 0 };
+    int connection_count = 0;
 
     while (continue_execution) {
-        const int conn_fd = recv_fd(c_sock_fd);
-
-        // is condition variable needed here?
-        pthread_mutex_lock(&shm->access_lock);
-        shm->p_inactive--;
-        if (shm->p_inactive < IDLE_CHILDREN && !shm->parent_informed) {
-            send(c_sock_fd, NULL, 0, 0);
-            shm->parent_informed = true;
-        }
-        pthread_mutex_unlock(&shm->access_lock);
-
-        char buffer[1024] = { 0 };
-        int bytes_recvd;
-        while ((bytes_recvd = recv(conn_fd, buffer, 1024, 0)) > 0) {
-            send(conn_fd, buffer, bytes_recvd, 0);
-            memset(buffer, '\0', 1024);
+        fd_set fdset;
+        int nfds = assemble_fdset(&fdset, connections, connection_count);
+        if (connection_count < CLIENTS_PER_PROCESS) {
+            FD_SET(c_sock_fd, &fdset);
+            nfds = nfds > c_sock_fd + 1 ? nfds : c_sock_fd + 1;
         }
 
-        pthread_mutex_lock(&shm->access_lock);
-        if (shm->p_inactive < IDLE_CHILDREN)
-            shm->p_inactive++;
-        else
-            continue_execution = false;
-        pthread_mutex_unlock(&shm->access_lock);
+        int event_count = select(nfds, &fdset, NULL, NULL, NULL);
 
-        shutdown(conn_fd, SHUT_WR);
-        close(conn_fd);
+        // client connection event
+        for (int i = 0; i < connection_count; i++) {
+            if (event_count > 0 && FD_ISSET(connections[i], &fdset)) {
+                char buffer[1024] = { 0 };
+                int bytes_recvd = recv(connections[i], buffer, 1024, 0);
+                if (bytes_recvd)
+                    send(connections[i], buffer, bytes_recvd, 0);
+                else {
+                    shutdown(connections[i], SHUT_WR);
+                    close(connections[i]);
+                    connections[i--] = connections[--connection_count]; // remove ith file descriptor, rerun iteration for new descriptor at index i
+                }
+                event_count--;
+            }
+        }
+
+        // new connection event
+        if (event_count > 0 && FD_ISSET(c_sock_fd, &fdset)) {
+            int new_conn_fd = recv_fd(c_sock_fd);
+            if (new_conn_fd != -1) {
+                connections[connection_count++] = new_conn_fd;
+
+                if (connection_count == 1) { // process went from inactive to active
+                    is_active = true;
+                    // is condition variable needed here?
+                    pthread_mutex_lock(&shm->access_lock);
+                    shm->p_inactive--;
+                    if (shm->p_inactive < IDLE_CHILDREN && !shm->parent_informed) {
+                        send(c_sock_fd, NULL, 0, 0);
+                        shm->parent_informed = true;
+                    }
+                    pthread_mutex_unlock(&shm->access_lock);
+                }
+            }
+
+            event_count--;
+        }
+
+        if (is_active && connection_count == 0) {
+            is_active = false;
+            pthread_mutex_lock(&shm->access_lock);
+            if (shm->p_inactive < IDLE_CHILDREN)
+                shm->p_inactive++;
+            else
+                continue_execution = false;
+            pthread_mutex_unlock(&shm->access_lock);
+        }
     }
+
+    printf("too many idle children, removing 1 process...\n");
 
     close(c_sock_fd);
     return;
@@ -132,22 +178,20 @@ int main(void) {
         pthread_mutex_init(&shm->access_lock, &mattr);
     }
 
-    int mq_id[2] = { msgget(IPC_PRIVATE, 0660), msgget(IPC_PRIVATE, 0660) };
-
     int p_sock_fd, c_sock_fd;
-
     {
         int temp_fd[2];
         socketpair(AF_UNIX, SOCK_DGRAM, 0, temp_fd);
         p_sock_fd = temp_fd[0];
         c_sock_fd = temp_fd[1];
     }
+    fcntl(c_sock_fd, F_SETFL, fcntl(c_sock_fd, F_GETFL) | O_NONBLOCK);
 
     for (long i = 0; i < IDLE_CHILDREN; i++) {
         pid_t temp = fork();
         if (!temp) {
             close(p_sock_fd);
-            execute_child(mq_id, c_sock_fd);
+            execute_child(c_sock_fd);
             exit(EXIT_SUCCESS);
         }
     }
@@ -167,36 +211,36 @@ int main(void) {
     }
     listen(socket_fd, TCP_BACKLOG_LEN);
 
-    const int nfds = (socket_fd > p_sock_fd ? socket_fd : p_sock_fd) + 1;
-
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_addr_len = sizeof client_addr;
 
         fd_set fdset;
-        FD_ZERO(&fdset);
-        FD_SET(socket_fd, &fdset);
-        FD_SET(p_sock_fd, &fdset);
+        const int nfds = assemble_fdset(&fdset, (int []) { socket_fd, p_sock_fd }, 2);
 
         select(nfds, &fdset, NULL, NULL, NULL);
 
         if (FD_ISSET(p_sock_fd, &fdset)) {
+
             char temp;
             recv(p_sock_fd, &temp, sizeof temp, 0);
 
             pthread_mutex_lock(&shm->access_lock);
             const int new_process_count = IDLE_CHILDREN - shm->p_inactive;
+            printf("%d\n", new_process_count);
             for (int i = 0; i < new_process_count; i++) {
                 pid_t temp = fork();
                 if (!temp) {
                     close(p_sock_fd);
-                    execute_child(mq_id, c_sock_fd);
+                    execute_child(c_sock_fd);
                     exit(EXIT_SUCCESS);
                 }
             }
             shm->p_inactive += new_process_count;
             shm->parent_informed = false;
             pthread_mutex_unlock(&shm->access_lock);
+
+            printf("created %d new process(es)...\n", new_process_count);
         }
 
         if (FD_ISSET(socket_fd, &fdset)) {
@@ -204,14 +248,6 @@ int main(void) {
             send_fd(p_sock_fd, conn_fd);
         }
     }
-
-    int rc = msgctl(mq_id[0], IPC_RMID, NULL);
-    if (rc == -1)
-        perror("msgctl[0]");
-
-    rc = msgctl(mq_id[1], IPC_RMID, NULL);
-    if (rc == -1)
-        perror("msgctl[1]");
 
     munmap(shm, sizeof *shm);
 
