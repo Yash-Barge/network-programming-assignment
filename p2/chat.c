@@ -21,6 +21,14 @@
 
 #define TCP_BACKLOG_LEN 5
 #define TCP_LISTENING_PORT 12345
+#define USER_NAME_LEN_LIMIT 32
+#define USER_COUNT_LIMIT 300
+
+struct user {
+    bool is_online;
+    int msg_queue_fd;
+    char name[USER_NAME_LEN_LIMIT];
+};
 
 // struct msgbuf {
 //     long mtype;
@@ -32,25 +40,30 @@ struct shared_mem {
     pthread_mutex_t access_lock;
     int p_inactive;
     bool parent_informed;
+    int user_count;
+    struct user user_list[USER_COUNT_LIMIT];
 };
 
 struct shared_mem *shm;
+bool is_parent = true;
+
+void interrupt_handler(int signo) {
+    if (!is_parent)
+        exit(EXIT_SUCCESS);
+
+    pthread_mutex_lock(&shm->access_lock);
+    for (int i = 0; i < shm->user_count; i++)
+        msgctl(shm->user_list[i].msg_queue_fd, IPC_RMID, NULL);
+    pthread_mutex_unlock(&shm->access_lock);
+
+    munmap(shm, sizeof *shm);
+
+    exit(EXIT_SUCCESS);
+}
 
 void error_and_exit(char *err_msg) {
     perror(err_msg);
     exit(EXIT_FAILURE);
-}
-
-int assemble_fdset(fd_set *fdset, int *fdarr, int len) {
-    FD_ZERO(fdset);
-    int max_fd = fdarr[0];
-
-    for (int i = 0; i < len; i++) {
-        FD_SET(fdarr[i], fdset);
-        max_fd = max_fd > fdarr[i] ? max_fd : fdarr[i];
-    }
-
-    return max_fd + 1;
 }
 
 void send_fd(int socket_fd, int payload_fd) {
@@ -92,9 +105,89 @@ int recv_fd(int socket_fd) {
     return recvd_fd;
 }
 
+struct connection {
+    int conn_fd;
+    int user_index;
+};
+
+int assemble_fdset(fd_set *fdset, struct connection *connections, int len) {
+    FD_ZERO(fdset);
+    int max_fd = connections[0].conn_fd;
+
+    for (int i = 0; i < len; i++) {
+        FD_SET(connections[i].conn_fd, fdset);
+        max_fd = max_fd > connections[i].conn_fd ? max_fd : connections[i].conn_fd;
+    }
+
+    return max_fd + 1;
+}
+
+// returns false if connection has closed
+bool handle_connection(struct connection *conn) {
+    char buffer[1024] = { 0 };
+    int bytes_recvd = recv(conn->conn_fd, buffer, 1024, 0);
+
+    if (buffer[bytes_recvd - 1] == '\n')
+        buffer[--bytes_recvd] = '\0';
+    if (buffer[bytes_recvd - 1] == '\r')
+        buffer[--bytes_recvd] = '\0';
+
+    if (!bytes_recvd) {
+        if (conn->user_index != -1) {
+            pthread_mutex_lock(&shm->access_lock);
+            shm->user_list[conn->user_index].is_online = false;
+            pthread_mutex_unlock(&shm->access_lock);
+        }
+
+        shutdown(conn->conn_fd, SHUT_WR);
+        close(conn->conn_fd);
+        return false;
+    }
+
+    char reply[1024] = { 0 };
+    int size = 0;
+
+    if (conn->user_index == -1) {
+        pthread_mutex_lock(&shm->access_lock);
+        for (int i = 0; i < shm->user_count; i++) {
+            if (!strcmp(buffer, shm->user_list[i].name)) {
+                if (shm->user_list[i].is_online)
+                    size = snprintf(reply, 1024, "User %s is already online! Enter a different username: ", buffer);
+                else {
+                    shm->user_list[i].is_online = true;
+                    conn->user_index = i;
+                    size = snprintf(reply, 1024, "Welcome back %s!\n", buffer);
+                }
+                break;
+            }
+        }
+        if (!size) { // user not in list, make a new one
+            shm->user_list[shm->user_count] = (struct user) { .is_online = true, .msg_queue_fd = msgget(IPC_PRIVATE, 0660) };
+            memcpy(shm->user_list[shm->user_count].name, buffer, bytes_recvd);
+            conn->user_index = shm->user_count++;
+            size = snprintf(reply, 1024, "New user %s created\n", buffer);
+        }
+        pthread_mutex_unlock(&shm->access_lock);
+    } else {
+        memcpy(reply, buffer, bytes_recvd);
+        reply[bytes_recvd] = '\n';
+        size = bytes_recvd + 1;
+    }
+
+    if (conn->user_index != -1) {
+        strcat(reply, shm->user_list[conn->user_index].name);
+        strcat(reply, "> ");
+        size += strlen(shm->user_list[conn->user_index].name) + 2;
+    }
+
+    send(conn->conn_fd, reply, size, 0);
+
+    return true;
+}
+
 void execute_child(int c_sock_fd) {
     bool continue_execution = true, is_active = false;
-    int connections[CLIENTS_PER_PROCESS] = { 0 };
+    struct connection connections[CLIENTS_PER_PROCESS] = {{ 0 } };
     int connection_count = 0;
 
     while (continue_execution) {
@@ -116,27 +209,30 @@ void execute_child(int c_sock_fd) {
 
         // client connection event
         for (int i = 0; event_count > 0 && i < connection_count; i++) {
-            if (FD_ISSET(connections[i], &fdset)) {
-                char buffer[1024] = { 0 };
-                int bytes_recvd = recv(connections[i], buffer, 1024, 0);
-                if (bytes_recvd)
-                    send(connections[i], buffer, bytes_recvd, 0);
-                else {
-                    shutdown(connections[i], SHUT_WR);
-                    close(connections[i]);
+            if (FD_ISSET(connections[i].conn_fd, &fdset)) {
+                const bool connection_alive = handle_connection(connections + i);
+
+                if (!connection_alive)
                     connections[i--] = connections[--connection_count]; // remove ith file descriptor, rerun iteration for new descriptor at index i
-                }
+
                 event_count--;
             }
         }
 
         // handle new connection
         if (new_conn_fd != -1) {
-            connections[connection_count++] = new_conn_fd;
+            connections[connection_count++] = (struct connection) { .conn_fd = new_conn_fd, .user_index = -1 };
+
+            const char msg_enter_username[] = "Enter username (limit of %d characters): ";
+            const int buffer_capacity = strlen(msg_enter_username) + 8; // just some wiggle room is limit is long
+            char buffer[buffer_capacity];
+            memset(buffer, '\0', buffer_capacity);
+            const int len = snprintf(buffer, buffer_capacity, msg_enter_username, USER_NAME_LEN_LIMIT-3);
+
+            send(new_conn_fd, buffer, len, 0);
 
             if (connection_count == 1) { // process went from inactive to active
                 is_active = true;
-                // is condition variable needed here?
                 pthread_mutex_lock(&shm->access_lock);
                 shm->p_inactive--;
                 if (shm->p_inactive < IDLE_CHILDREN && !shm->parent_informed) {
@@ -165,6 +261,8 @@ void execute_child(int c_sock_fd) {
 }
 
 int main(void) {
+    signal(SIGINT, interrupt_handler); // cleanup message queues
+
     // children do not become zombies when they exit, no need to wait on them
     sigset_t block_sigchld;
     sigemptyset(&block_sigchld);
@@ -192,6 +290,7 @@ int main(void) {
     for (long i = 0; i < IDLE_CHILDREN; i++) {
         pid_t temp = fork();
         if (!temp) {
+            is_parent = false;
             close(p_sock_fd);
             execute_child(c_sock_fd);
             exit(EXIT_SUCCESS);
@@ -213,12 +312,17 @@ int main(void) {
     }
     listen(socket_fd, TCP_BACKLOG_LEN);
 
+    const int nfds = (socket_fd > p_sock_fd ? socket_fd : p_sock_fd) + 1;
+    fd_set ref_fdset;
+    FD_ZERO(&ref_fdset);
+    FD_SET(socket_fd, &ref_fdset);
+    FD_SET(p_sock_fd, &ref_fdset);
+
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_addr_len = sizeof client_addr;
 
-        fd_set fdset;
-        const int nfds = assemble_fdset(&fdset, (int []) { socket_fd, p_sock_fd }, 2);
+        fd_set fdset = ref_fdset;
 
         select(nfds, &fdset, NULL, NULL, NULL);
 
@@ -232,6 +336,7 @@ int main(void) {
             for (int i = 0; i < new_process_count; i++) {
                 pid_t temp = fork();
                 if (!temp) {
+                    is_parent = false;
                     close(p_sock_fd);
                     execute_child(c_sock_fd);
                     exit(EXIT_SUCCESS);
