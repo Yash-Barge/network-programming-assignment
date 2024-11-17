@@ -106,10 +106,17 @@ void execute_child(int c_sock_fd) {
         }
 
         int event_count = select(nfds, &fdset, NULL, NULL, NULL);
+        
+        // new connection event, recv immediately to mitigate thundering herd
+        int new_conn_fd = -1;
+        if (event_count > 0 && FD_ISSET(c_sock_fd, &fdset)) {
+            new_conn_fd = recv_fd(c_sock_fd);
+            event_count--;
+        }
 
         // client connection event
-        for (int i = 0; i < connection_count; i++) {
-            if (event_count > 0 && FD_ISSET(connections[i], &fdset)) {
+        for (int i = 0; event_count > 0 && i < connection_count; i++) {
+            if (FD_ISSET(connections[i], &fdset)) {
                 char buffer[1024] = { 0 };
                 int bytes_recvd = recv(connections[i], buffer, 1024, 0);
                 if (bytes_recvd)
@@ -123,26 +130,21 @@ void execute_child(int c_sock_fd) {
             }
         }
 
-        // new connection event
-        if (event_count > 0 && FD_ISSET(c_sock_fd, &fdset)) {
-            int new_conn_fd = recv_fd(c_sock_fd);
-            if (new_conn_fd != -1) {
-                connections[connection_count++] = new_conn_fd;
+        // handle new connection
+        if (new_conn_fd != -1) {
+            connections[connection_count++] = new_conn_fd;
 
-                if (connection_count == 1) { // process went from inactive to active
-                    is_active = true;
-                    // is condition variable needed here?
-                    pthread_mutex_lock(&shm->access_lock);
-                    shm->p_inactive--;
-                    if (shm->p_inactive < IDLE_CHILDREN && !shm->parent_informed) {
-                        send(c_sock_fd, NULL, 0, 0);
-                        shm->parent_informed = true;
-                    }
-                    pthread_mutex_unlock(&shm->access_lock);
+            if (connection_count == 1) { // process went from inactive to active
+                is_active = true;
+                // is condition variable needed here?
+                pthread_mutex_lock(&shm->access_lock);
+                shm->p_inactive--;
+                if (shm->p_inactive < IDLE_CHILDREN && !shm->parent_informed) {
+                    send(c_sock_fd, NULL, 0, 0);
+                    shm->parent_informed = true;
                 }
+                pthread_mutex_unlock(&shm->access_lock);
             }
-
-            event_count--;
         }
 
         if (is_active && connection_count == 0) {
@@ -227,7 +229,6 @@ int main(void) {
 
             pthread_mutex_lock(&shm->access_lock);
             const int new_process_count = IDLE_CHILDREN - shm->p_inactive;
-            printf("%d\n", new_process_count);
             for (int i = 0; i < new_process_count; i++) {
                 pid_t temp = fork();
                 if (!temp) {
