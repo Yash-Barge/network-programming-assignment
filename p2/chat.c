@@ -42,6 +42,7 @@ struct shared_mem {
 struct shared_mem *shm;
 bool is_parent = true;
 
+// TODO: fix
 void interrupt_handler(int signo) {
     if (!is_parent)
         exit(EXIT_SUCCESS);
@@ -166,7 +167,7 @@ bool recv_from_connection(struct connection *conn) {
             }
         }
         if (!size) { // user not in list, make a new one
-            shm->user_list[shm->user_count] = (struct user) { .is_online = true, .msg_queue_fd = msgget(IPC_PRIVATE, 0660) };
+            shm->user_list[shm->user_count] = (struct user) { .is_online = true, .msg_queue_fd = msgget(IPC_PRIVATE, 0660) }; // TODO: fix
             memcpy(shm->user_list[shm->user_count].name, buffer, bytes_recvd);
             conn->user_index = shm->user_count++;
             size = snprintf(reply, 1024, "New user %s created\n", buffer);
@@ -369,7 +370,7 @@ int main(void) {
         socket_fd = socket(AF_INET, SOCK_STREAM, 0);
         int retval = bind(socket_fd, (const struct sockaddr *) &addr, sizeof addr);
 
-        if (retval == -1)
+        if (retval == -1) // TODO: fix - exiting leaves children alive
             error_and_exit("bind failure");
     }
     listen(socket_fd, TCP_BACKLOG_LEN);
