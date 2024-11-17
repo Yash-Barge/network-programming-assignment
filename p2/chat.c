@@ -26,14 +26,9 @@
 
 struct user {
     bool is_online;
-    int msg_queue_fd;
+    int msg_queue_fd; // TODO: fix
     char name[USER_NAME_LEN_LIMIT];
 };
-
-// struct msgbuf {
-//     long mtype;
-//     char mtext[1];
-// };
 
 // user data and message queues will have to go in here
 struct shared_mem {
@@ -117,13 +112,24 @@ int assemble_fdset(fd_set *fdset, struct connection *connections, int len) {
     for (int i = 0; i < len; i++) {
         FD_SET(connections[i].conn_fd, fdset);
         max_fd = max_fd > connections[i].conn_fd ? max_fd : connections[i].conn_fd;
+
+        // TODO: fix
+        // if (connections[i].user_index != -1) {
+        //     FD_SET(shm->user_list[connections[i].user_index].msg_queue_fd, fdset);
+        //     max_fd = max_fd > shm->user_list[connections[i].user_index].msg_queue_fd ? max_fd : shm->user_list[connections[i].user_index].msg_queue_fd;
+        // }
     }
 
     return max_fd + 1;
 }
 
+struct msgbuf {
+    long mtype;
+    char mtext[1024];
+};
+
 // returns false if connection has closed
-bool handle_connection(struct connection *conn) {
+bool recv_from_connection(struct connection *conn) {
     char buffer[1024] = { 0 };
     int bytes_recvd = recv(conn->conn_fd, buffer, 1024, 0);
 
@@ -133,14 +139,12 @@ bool handle_connection(struct connection *conn) {
         buffer[--bytes_recvd] = '\0';
 
     if (!bytes_recvd) {
-        if (conn->user_index != -1) {
-            pthread_mutex_lock(&shm->access_lock);
-            shm->user_list[conn->user_index].is_online = false;
-            pthread_mutex_unlock(&shm->access_lock);
-        }
-
         shutdown(conn->conn_fd, SHUT_WR);
         close(conn->conn_fd);
+
+        if (conn->user_index != -1)
+            shm->user_list[conn->user_index].is_online = false;
+
         return false;
     }
 
@@ -169,9 +173,53 @@ bool handle_connection(struct connection *conn) {
         }
         pthread_mutex_unlock(&shm->access_lock);
     } else {
-        memcpy(reply, buffer, bytes_recvd);
-        reply[bytes_recvd] = '\n';
-        size = bytes_recvd + 1;
+        if (!strcmp(buffer, "help")) {
+            const char msg_help[] = "help         Display this message.\n"
+                                    "listu        List all users.\n";
+            
+            size = strlen(msg_help);
+            memcpy(reply, msg_help, size);
+        } else if (!strcmp(buffer, "listu")) {
+            pthread_mutex_lock(&shm->access_lock);
+            for (int i = 0; i < shm->user_count; i++)
+                size += snprintf(reply + size, 1024 - size, "%3d: %10s (%s)\n", i+1, shm->user_list[i].name, shm->user_list[i].is_online ? "online" : "offline");
+            pthread_mutex_unlock(&shm->access_lock);
+        }
+        // TODO: fix
+        /* else if (!strncmp(buffer, "msgu ", 5)) {
+            int r;
+            for (r = 5; r < strlen(buffer); r++)
+                if (buffer[r] == ' ')
+                    break;
+            if (r == 5 || r == strlen(buffer))
+                goto unknown_cmd;
+
+            char target_user[r - 5 + 1];
+            memcpy(target_user, buffer + 5, r - 5);
+            target_user[r - 5] = '\0';
+            
+            const int user_count = shm->user_count;
+            int target_user_index;
+            for (int target_user_index = 0; target_user_index < user_count; target_user_index++) {
+                if (!strcmp(shm->user_list[target_user_index].name, target_user))
+                    break;
+            }
+            if (target_user_index == user_count)
+                goto unknown_cmd;
+
+            struct msgbuf msg = { .mtype = 0, .mtext = "\r" };
+            int mtext_len = 1;
+            mtext_len += snprintf(msg.mtext + mtext_len, 1024 - mtext_len, "FROM %s: %s\n", shm->user_list[target_user_index].name, buffer + r + 1);
+
+            msgsnd(shm->user_list[target_user_index].msg_queue_fd, &msg, mtext_len+1, 0);
+        } */
+        else {
+        unknown_cmd:;
+            const char msg_unknown[] = "Unknown command. Enter `help` to see a list of supported commands.\n";
+
+            size = strlen(msg_unknown);
+            memcpy(reply, msg_unknown, size);
+        }
     }
 
     if (conn->user_index != -1) {
@@ -183,6 +231,15 @@ bool handle_connection(struct connection *conn) {
     send(conn->conn_fd, reply, size, 0);
 
     return true;
+}
+
+// TODO: fix
+void send_to_connection(struct connection *conn) {
+    struct msgbuf msg = { 0 };
+    msgrcv(shm->user_list[conn->user_index].msg_queue_fd, &msg, 1024, 0, 0);
+    send(conn->conn_fd, msg.mtext, strlen(msg.mtext), 0);
+
+    return;
 }
 
 void execute_child(int c_sock_fd) {
@@ -210,13 +267,18 @@ void execute_child(int c_sock_fd) {
         // client connection event
         for (int i = 0; event_count > 0 && i < connection_count; i++) {
             if (FD_ISSET(connections[i].conn_fd, &fdset)) {
-                const bool connection_alive = handle_connection(connections + i);
+                const bool connection_alive = recv_from_connection(connections + i);
 
                 if (!connection_alive)
                     connections[i--] = connections[--connection_count]; // remove ith file descriptor, rerun iteration for new descriptor at index i
 
                 event_count--;
+                continue;
             }
+
+            // TODO: fix
+            // if (connections[i].user_index != -1 && FD_ISSET(shm->user_list[connections[i].user_index].msg_queue_fd, &fdset))
+            //     send_to_connection(connections + i);
         }
 
         // handle new connection
