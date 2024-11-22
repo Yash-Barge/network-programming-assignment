@@ -129,6 +129,18 @@ int assemble_fdset(fd_set *fdset, struct connection *connections, int len) {
     return max_fd + 1;
 }
 
+void send_message_to(int target_user_index, char *msg_buffer) {
+    char temp_buffer[32] = { 0 };
+    size_t buflen = snprintf(temp_buffer, 32, "/chat_server_%.3d", target_user_index);
+    const mqd_t msg_queue_fd = mq_open(temp_buffer, O_WRONLY); // could be on other process, fd could be different
+
+    mq_send(msg_queue_fd, msg_buffer, strlen(msg_buffer), 0);
+
+    mq_close(msg_queue_fd);
+
+    return;
+}
+
 // returns false if connection has closed
 bool recv_from_connection(struct connection *conn) {
     char buffer[1024] = { 0 };
@@ -178,16 +190,18 @@ bool recv_from_connection(struct connection *conn) {
             conn->user_index = shm->user_count++;
 
             char temp_buffer[32] = { 0 };
-                    snprintf(temp_buffer, 32, "/chat_server_%.3d", conn->user_index);
-                    conn->msg_queue_fd = mq_open(temp_buffer, O_CREAT | O_RDONLY | O_NONBLOCK, 0660, NULL);
+            snprintf(temp_buffer, 32, "/chat_server_%.3d", conn->user_index);
+            conn->msg_queue_fd = mq_open(temp_buffer, O_CREAT | O_RDONLY | O_NONBLOCK, 0660, NULL);
 
             size = snprintf(reply, 1024, "New user %s created\n", buffer);
         }
         pthread_mutex_unlock(&shm->access_lock);
     } else {
         if (!strcmp(buffer, "help")) {
-            const char msg_help[] = "help         Display this message.\n"
-                                    "listu        List all users.\n";
+            const char msg_help[] = "help                             Display this message.\n"
+                                    "listu                            List all users.\n"
+                                    "msgu <user-name> <message>       Send message to user.\n"
+                                    "msga <message>                   Broadcast a message to all users.\n";
             
             size = strlen(msg_help);
             memcpy(reply, msg_help, size);
@@ -196,9 +210,7 @@ bool recv_from_connection(struct connection *conn) {
             for (int i = 0; i < shm->user_count; i++)
                 size += snprintf(reply + size, 1024 - size, "%3d: %10s (%s)\n", i+1, shm->user_list[i].name, shm->user_list[i].is_online ? "online" : "offline");
             pthread_mutex_unlock(&shm->access_lock);
-        }
-        // TODO: fix
-        else if (!strncmp(buffer, "msgu ", 5)) {
+        } else if (!strncmp(buffer, "msgu ", 5)) {
             int r;
             for (r = 5; r < strlen(buffer); r++)
                 if (buffer[r] == ' ')
@@ -224,15 +236,19 @@ bool recv_from_connection(struct connection *conn) {
 
             mtext_len += snprintf(msg_buffer + mtext_len, 2048 - mtext_len, "FROM %s: %s\n", shm->user_list[conn->user_index].name, buffer + r + 1);
 
-            char temp_buffer[32] = { 0 };
-            size_t buflen = snprintf(temp_buffer, 32, "/chat_server_%.3d", target_user_index);
-            const mqd_t msg_queue_fd = mq_open(temp_buffer, O_WRONLY); // could be on other process, fd could be different
+            send_message_to(target_user_index, msg_buffer);
+        } else if (!strncmp(buffer, "msga ", 5)) {
+            char msg_buffer[2048] = { '\r' };
+            int mtext_len = 1;
 
-            mq_send(msg_queue_fd, msg_buffer, mtext_len, 0);
+            mtext_len += snprintf(msg_buffer + mtext_len, 2048 - mtext_len, "BROADCAST FROM %s: %s\n", shm->user_list[conn->user_index].name, buffer + 5);
 
-            mq_close(msg_queue_fd);
-        }
-        else {
+            const int user_count = shm->user_count;
+            for (int i = 0; i < user_count; i++)
+                if (i != conn->user_index)
+                    send_message_to(i, msg_buffer);
+
+        } else {
         unknown_cmd:;
             const char msg_unknown[] = "Unknown command. Enter `help` to see a list of supported commands.\n";
 
