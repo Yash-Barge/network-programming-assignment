@@ -15,6 +15,8 @@
 #include <sys/select.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <mqueue.h>
 
 #define IDLE_CHILDREN 5
 #define CLIENTS_PER_PROCESS 3
@@ -22,11 +24,10 @@
 #define TCP_BACKLOG_LEN 5
 #define TCP_LISTENING_PORT 12345
 #define USER_NAME_LEN_LIMIT 32
-#define USER_COUNT_LIMIT 300
+#define USER_COUNT_LIMIT 100
 
 struct user {
     bool is_online;
-    int msg_queue_fd; // TODO: fix
     char name[USER_NAME_LEN_LIMIT];
 };
 
@@ -42,14 +43,18 @@ struct shared_mem {
 struct shared_mem *shm;
 bool is_parent = true;
 
-// TODO: fix
 void interrupt_handler(int signo) {
     if (!is_parent)
         exit(EXIT_SUCCESS);
 
     pthread_mutex_lock(&shm->access_lock);
-    for (int i = 0; i < shm->user_count; i++)
-        msgctl(shm->user_list[i].msg_queue_fd, IPC_RMID, NULL);
+    for (int i = 0; i < shm->user_count; i++) {
+        // mq_close(shm->user_list[i].msg_queue_fd);
+
+        char temp_buffer[32] = { 0 };
+        size_t buflen = snprintf(temp_buffer, 32, "/chat_server_%.3d", i);
+        mq_unlink(temp_buffer);
+    }
     pthread_mutex_unlock(&shm->access_lock);
 
     munmap(shm, sizeof *shm);
@@ -104,6 +109,7 @@ int recv_fd(int socket_fd) {
 struct connection {
     int conn_fd;
     int user_index;
+    mqd_t msg_queue_fd;
 };
 
 int assemble_fdset(fd_set *fdset, struct connection *connections, int len) {
@@ -114,20 +120,14 @@ int assemble_fdset(fd_set *fdset, struct connection *connections, int len) {
         FD_SET(connections[i].conn_fd, fdset);
         max_fd = max_fd > connections[i].conn_fd ? max_fd : connections[i].conn_fd;
 
-        // TODO: fix
-        // if (connections[i].user_index != -1) {
-        //     FD_SET(shm->user_list[connections[i].user_index].msg_queue_fd, fdset);
-        //     max_fd = max_fd > shm->user_list[connections[i].user_index].msg_queue_fd ? max_fd : shm->user_list[connections[i].user_index].msg_queue_fd;
-        // }
+        if (connections[i].user_index != -1) {
+            FD_SET(connections[i].msg_queue_fd, fdset);
+            max_fd = max_fd > connections[i].msg_queue_fd ? max_fd : connections[i].msg_queue_fd;
+        }
     }
 
     return max_fd + 1;
 }
-
-struct msgbuf {
-    long mtype;
-    char mtext[1024];
-};
 
 // returns false if connection has closed
 bool recv_from_connection(struct connection *conn) {
@@ -161,15 +161,26 @@ bool recv_from_connection(struct connection *conn) {
                 else {
                     shm->user_list[i].is_online = true;
                     conn->user_index = i;
+
+                    char temp_buffer[32] = { 0 };
+                    snprintf(temp_buffer, 32, "/chat_server_%.3d", i);
+                    conn->msg_queue_fd = mq_open(temp_buffer, O_CREAT | O_RDONLY | O_NONBLOCK, 0660, NULL);
+
                     size = snprintf(reply, 1024, "Welcome back %s!\n", buffer);
                 }
                 break;
             }
         }
         if (!size) { // user not in list, make a new one
-            shm->user_list[shm->user_count] = (struct user) { .is_online = true, .msg_queue_fd = msgget(IPC_PRIVATE, 0660) }; // TODO: fix
+            shm->user_list[shm->user_count] = (struct user) { .is_online = true };
+
             memcpy(shm->user_list[shm->user_count].name, buffer, bytes_recvd);
             conn->user_index = shm->user_count++;
+
+            char temp_buffer[32] = { 0 };
+                    snprintf(temp_buffer, 32, "/chat_server_%.3d", conn->user_index);
+                    conn->msg_queue_fd = mq_open(temp_buffer, O_CREAT | O_RDONLY | O_NONBLOCK, 0660, NULL);
+
             size = snprintf(reply, 1024, "New user %s created\n", buffer);
         }
         pthread_mutex_unlock(&shm->access_lock);
@@ -187,7 +198,7 @@ bool recv_from_connection(struct connection *conn) {
             pthread_mutex_unlock(&shm->access_lock);
         }
         // TODO: fix
-        /* else if (!strncmp(buffer, "msgu ", 5)) {
+        else if (!strncmp(buffer, "msgu ", 5)) {
             int r;
             for (r = 5; r < strlen(buffer); r++)
                 if (buffer[r] == ' ')
@@ -201,19 +212,26 @@ bool recv_from_connection(struct connection *conn) {
             
             const int user_count = shm->user_count;
             int target_user_index;
-            for (int target_user_index = 0; target_user_index < user_count; target_user_index++) {
+            for (target_user_index = 0; target_user_index < user_count; target_user_index++) {
                 if (!strcmp(shm->user_list[target_user_index].name, target_user))
                     break;
             }
             if (target_user_index == user_count)
                 goto unknown_cmd;
 
-            struct msgbuf msg = { .mtype = 0, .mtext = "\r" };
+            char msg_buffer[2048] = { '\r' };
             int mtext_len = 1;
-            mtext_len += snprintf(msg.mtext + mtext_len, 1024 - mtext_len, "FROM %s: %s\n", shm->user_list[target_user_index].name, buffer + r + 1);
 
-            msgsnd(shm->user_list[target_user_index].msg_queue_fd, &msg, mtext_len+1, 0);
-        } */
+            mtext_len += snprintf(msg_buffer + mtext_len, 2048 - mtext_len, "FROM %s: %s\n", shm->user_list[conn->user_index].name, buffer + r + 1);
+
+            char temp_buffer[32] = { 0 };
+            size_t buflen = snprintf(temp_buffer, 32, "/chat_server_%.3d", target_user_index);
+            const mqd_t msg_queue_fd = mq_open(temp_buffer, O_WRONLY); // could be on other process, fd could be different
+
+            mq_send(msg_queue_fd, msg_buffer, mtext_len, 0);
+
+            mq_close(msg_queue_fd);
+        }
         else {
         unknown_cmd:;
             const char msg_unknown[] = "Unknown command. Enter `help` to see a list of supported commands.\n";
@@ -234,18 +252,21 @@ bool recv_from_connection(struct connection *conn) {
     return true;
 }
 
-// TODO: fix
 void send_to_connection(struct connection *conn) {
-    struct msgbuf msg = { 0 };
-    msgrcv(shm->user_list[conn->user_index].msg_queue_fd, &msg, 1024, 0, 0);
-    send(conn->conn_fd, msg.mtext, strlen(msg.mtext), 0);
+    char buffer[8192] = { 0 };
+    // TODO: can fail with EAGAIN if there are too many messages
+    mq_receive(conn->msg_queue_fd, buffer, 8192, NULL);
+    strcat(buffer, shm->user_list[conn->user_index].name);
+    strcat(buffer, "> ");
+
+    send(conn->conn_fd, buffer, strlen(buffer), 0);
 
     return;
 }
 
 void execute_child(int c_sock_fd) {
     bool continue_execution = true, is_active = false;
-    struct connection connections[CLIENTS_PER_PROCESS] = {{ 0 } };
+    struct connection connections[CLIENTS_PER_PROCESS] = { { 0 } };
     int connection_count = 0;
 
     while (continue_execution) {
@@ -277,9 +298,10 @@ void execute_child(int c_sock_fd) {
                 continue;
             }
 
-            // TODO: fix
-            // if (connections[i].user_index != -1 && FD_ISSET(shm->user_list[connections[i].user_index].msg_queue_fd, &fdset))
-            //     send_to_connection(connections + i);
+            if (connections[i].user_index != -1 && FD_ISSET(connections[i].msg_queue_fd, &fdset)) {
+                send_to_connection(connections + i);
+                event_count--;
+            }
         }
 
         // handle new connection
