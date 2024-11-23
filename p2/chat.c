@@ -43,7 +43,8 @@ struct group {
 
 // user data and message queues will have to go in here
 struct shared_mem {
-    pthread_mutex_t access_lock;
+    pthread_mutex_t data_access_lock;
+    pthread_mutex_t socket_access_lock;
     int p_inactive;
     bool parent_informed;
     int user_count;
@@ -59,7 +60,7 @@ void interrupt_handler(int signo) {
     if (!is_parent)
         exit(EXIT_SUCCESS);
 
-    pthread_mutex_lock(&shm->access_lock);
+    pthread_mutex_lock(&shm->data_access_lock);
     for (int i = 0; i < shm->user_count; i++) {
         // mq_close(shm->user_list[i].msg_queue_fd);
 
@@ -67,7 +68,7 @@ void interrupt_handler(int signo) {
         size_t buflen = snprintf(temp_buffer, 32, "/chat_server_%.3d", i);
         mq_unlink(temp_buffer);
     }
-    pthread_mutex_unlock(&shm->access_lock);
+    pthread_mutex_unlock(&shm->data_access_lock);
 
     munmap(shm, sizeof *shm);
 
@@ -181,7 +182,7 @@ bool recv_from_connection(struct connection *conn) {
     int size = 0;
 
     if (conn->user_index == -1) {
-        pthread_mutex_lock(&shm->access_lock);
+        pthread_mutex_lock(&shm->data_access_lock);
         for (int i = 0; i < shm->user_count; i++) {
             if (!strcmp(buffer, shm->user_list[i].name)) {
                 if (shm->user_list[i].is_online)
@@ -214,7 +215,7 @@ bool recv_from_connection(struct connection *conn) {
             size += snprintf(reply, 1024, welcome_msg);
         } else if (!size)
             size = snprintf(reply, 1024, "Spaces are not allowed! Enter a different username: ");
-        pthread_mutex_unlock(&shm->access_lock);
+        pthread_mutex_unlock(&shm->data_access_lock);
     } else {
         if (!strcmp(buffer, "help")) {
             const char msg_help[] = "help                              Display this message.\n"
@@ -229,10 +230,10 @@ bool recv_from_connection(struct connection *conn) {
             size = strlen(msg_help);
             memcpy(reply, msg_help, size);
         } else if (!strcmp(buffer, "listu")) {
-            pthread_mutex_lock(&shm->access_lock);
+            pthread_mutex_lock(&shm->data_access_lock);
             for (int i = 0; i < shm->user_count; i++)
                 size += snprintf(reply + size, 1024 - size, "%3d: %10s (%s)\n", i+1, shm->user_list[i].name, shm->user_list[i].is_online ? "online" : "offline");
-            pthread_mutex_unlock(&shm->access_lock);
+            pthread_mutex_unlock(&shm->data_access_lock);
         } else if (!strncmp(buffer, "msgu ", 5)) {
             int r;
             for (r = 5; r < strlen(buffer); r++)
@@ -402,25 +403,31 @@ void send_to_connection(struct connection *conn) {
 }
 
 void execute_child(int c_sock_fd) {
-    bool continue_execution = true, is_active = false;
+    bool continue_execution = true, is_active = false, acquired_socket_lock = false;
     struct connection connections[CLIENTS_PER_PROCESS] = { { 0 } };
     int connection_count = 0;
 
     while (continue_execution) {
         fd_set fdset;
         int nfds = assemble_fdset(&fdset, connections, connection_count);
-        if (connection_count < CLIENTS_PER_PROCESS) {
+        if ((connection_count < CLIENTS_PER_PROCESS) && (pthread_mutex_trylock(&shm->socket_access_lock) != -1)) {
+            acquired_socket_lock = true;
             FD_SET(c_sock_fd, &fdset);
             nfds = nfds > c_sock_fd + 1 ? nfds : c_sock_fd + 1;
         }
 
         int event_count = select(nfds, &fdset, NULL, NULL, NULL);
         
-        // new connection event, recv immediately to mitigate thundering herd
+        // new connection event
         int new_conn_fd = -1;
         if (event_count > 0 && FD_ISSET(c_sock_fd, &fdset)) {
             new_conn_fd = recv_fd(c_sock_fd);
             event_count--;
+        }
+
+        if (acquired_socket_lock) {
+            pthread_mutex_unlock(&shm->socket_access_lock);
+            acquired_socket_lock = false;
         }
 
         // client connection event
@@ -455,24 +462,24 @@ void execute_child(int c_sock_fd) {
 
             if (connection_count == 1) { // process went from inactive to active
                 is_active = true;
-                pthread_mutex_lock(&shm->access_lock);
+                pthread_mutex_lock(&shm->data_access_lock);
                 shm->p_inactive--;
                 if (shm->p_inactive < IDLE_CHILDREN && !shm->parent_informed) {
                     send(c_sock_fd, NULL, 0, 0);
                     shm->parent_informed = true;
                 }
-                pthread_mutex_unlock(&shm->access_lock);
+                pthread_mutex_unlock(&shm->data_access_lock);
             }
         }
 
         if (is_active && connection_count == 0) {
             is_active = false;
-            pthread_mutex_lock(&shm->access_lock);
+            pthread_mutex_lock(&shm->data_access_lock);
             if (shm->p_inactive < IDLE_CHILDREN)
                 shm->p_inactive++;
             else
                 continue_execution = false;
-            pthread_mutex_unlock(&shm->access_lock);
+            pthread_mutex_unlock(&shm->data_access_lock);
         }
     }
 
@@ -507,7 +514,13 @@ int main(void) {
         pthread_mutexattr_t mattr;
         pthread_mutexattr_init(&mattr);
         pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
-        pthread_mutex_init(&shm->access_lock, &mattr);
+        pthread_mutex_init(&shm->data_access_lock, &mattr);
+    }
+    {
+        pthread_mutexattr_t mattr;
+        pthread_mutexattr_init(&mattr);
+        pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
+        pthread_mutex_init(&shm->socket_access_lock, &mattr);
     }
 
     int p_sock_fd, c_sock_fd;
@@ -554,7 +567,7 @@ int main(void) {
             char temp;
             recv(p_sock_fd, &temp, sizeof temp, 0);
 
-            pthread_mutex_lock(&shm->access_lock);
+            pthread_mutex_lock(&shm->data_access_lock);
             const int new_process_count = IDLE_CHILDREN - shm->p_inactive;
             for (int i = 0; i < new_process_count; i++) {
                 pid_t temp = fork();
@@ -567,7 +580,7 @@ int main(void) {
             }
             shm->p_inactive += new_process_count;
             shm->parent_informed = false;
-            pthread_mutex_unlock(&shm->access_lock);
+            pthread_mutex_unlock(&shm->data_access_lock);
 
             printf("created %d new process(es)...\n", new_process_count);
         }
