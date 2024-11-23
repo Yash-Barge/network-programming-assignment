@@ -23,12 +23,22 @@
 
 #define TCP_BACKLOG_LEN 5
 #define TCP_LISTENING_PORT 12345
+
 #define USER_NAME_LEN_LIMIT 32
 #define USER_COUNT_LIMIT 100
+
+#define GROUP_NAME_LEN_LIMIT 32
+#define GROUP_COUNT_LIMIT 100
 
 struct user {
     bool is_online;
     char name[USER_NAME_LEN_LIMIT];
+};
+
+struct group {
+    char name[GROUP_NAME_LEN_LIMIT];
+    int user_ids[USER_COUNT_LIMIT];
+    int size;
 };
 
 // user data and message queues will have to go in here
@@ -38,6 +48,8 @@ struct shared_mem {
     bool parent_informed;
     int user_count;
     struct user user_list[USER_COUNT_LIMIT];
+    int group_count;
+    struct group group_list[GROUP_COUNT_LIMIT];
 };
 
 struct shared_mem *shm;
@@ -141,6 +153,10 @@ void send_message_to(int target_user_index, char *msg_buffer) {
     return;
 }
 
+const char welcome_msg[] = "Enter `help` to view a list of commands.\n"
+                            "Press ENTER on a blank line to logoff.\n"
+                            ;
+
 // returns false if connection has closed
 bool recv_from_connection(struct connection *conn) {
     char buffer[1024] = { 0 };
@@ -179,11 +195,12 @@ bool recv_from_connection(struct connection *conn) {
                     conn->msg_queue_fd = mq_open(temp_buffer, O_CREAT | O_RDONLY | O_NONBLOCK, 0660, NULL);
 
                     size = snprintf(reply, 1024, "Welcome back %s!\n", buffer);
+                    size += snprintf(reply, 1024, welcome_msg);
                 }
                 break;
             }
         }
-        if (!size) { // user not in list, make a new one
+        if (!size && !strchr(buffer, ' ')) { // user not in list, make a new one
             shm->user_list[shm->user_count] = (struct user) { .is_online = true };
 
             memcpy(shm->user_list[shm->user_count].name, buffer, bytes_recvd);
@@ -194,14 +211,20 @@ bool recv_from_connection(struct connection *conn) {
             conn->msg_queue_fd = mq_open(temp_buffer, O_CREAT | O_RDONLY | O_NONBLOCK, 0660, NULL);
 
             size = snprintf(reply, 1024, "New user %s created\n", buffer);
-        }
+            size += snprintf(reply, 1024, welcome_msg);
+        } else if (!size)
+            size = snprintf(reply, 1024, "Spaces are not allowed! Enter a different username: ");
         pthread_mutex_unlock(&shm->access_lock);
     } else {
         if (!strcmp(buffer, "help")) {
-            const char msg_help[] = "help                             Display this message.\n"
-                                    "listu                            List all users.\n"
-                                    "msgu <user-name> <message>       Send message to user.\n"
-                                    "msga <message>                   Broadcast a message to all users.\n";
+            const char msg_help[] = "help                              Display this message.\n"
+                                    "listu                             List all users.\n"
+                                    "msgu <user-name> <message>        Send message to user.\n"
+                                    "mkgrp <grp-name> <usr-name> ...   Make group with space separated list of users.\n"
+                                    "listg                             List all groups you are a part of.\n"
+                                    "msgg <grp-name> <message>         Message all group members.\n"
+                                    "msga <message>                    Broadcast a message to all users.\n"
+                                    ;
             
             size = strlen(msg_help);
             memcpy(reply, msg_help, size);
@@ -228,15 +251,17 @@ bool recv_from_connection(struct connection *conn) {
                 if (!strcmp(shm->user_list[target_user_index].name, target_user))
                     break;
             }
-            if (target_user_index == user_count)
-                goto unknown_cmd;
+            if (target_user_index == user_count) {
+                size += snprintf(reply + size, 1024 - size, "user `%s` not found\n", target_user);
+            } else {
+                char msg_buffer[2048] = { '\r' };
+                int mtext_len = 1;
 
-            char msg_buffer[2048] = { '\r' };
-            int mtext_len = 1;
+                mtext_len += snprintf(msg_buffer + mtext_len, 2048 - mtext_len, "FROM %s: %s\n", shm->user_list[conn->user_index].name, buffer + r + 1);
 
-            mtext_len += snprintf(msg_buffer + mtext_len, 2048 - mtext_len, "FROM %s: %s\n", shm->user_list[conn->user_index].name, buffer + r + 1);
-
-            send_message_to(target_user_index, msg_buffer);
+                send_message_to(target_user_index, msg_buffer);
+                size += snprintf(reply + size, 1024 - size, "message sent to %s\n", target_user);
+            }
         } else if (!strncmp(buffer, "msga ", 5)) {
             char msg_buffer[2048] = { '\r' };
             int mtext_len = 1;
@@ -248,6 +273,102 @@ bool recv_from_connection(struct connection *conn) {
                 if (i != conn->user_index)
                     send_message_to(i, msg_buffer);
 
+        } else if (!strncmp(buffer, "mkgrp ", 6)) {
+            const int user_count = shm->user_count;
+
+            int group_users[USER_COUNT_LIMIT] = { 0 };
+            int group_size = 0;
+
+            char *substr = strtok(buffer, " ");
+            char *group_name = strtok(NULL, " ");
+        
+            while ((substr = strtok(NULL, " "))) {
+                int target_user_index;
+                for (target_user_index = 0; target_user_index < user_count; target_user_index++) {
+                    if (!strcmp(substr, shm->user_list[target_user_index].name)) {
+                        group_users[group_size++] = target_user_index;
+                        break;
+                    }
+                }
+                if (target_user_index == user_count)
+                    size += snprintf(reply + size, 1024 - size, "user `%s` not found\n", substr);
+            }
+            if (group_size < 3) {
+                size += snprintf(reply + size, 1024 - size, "need at least 3 users to make a group!\n");
+            } else {
+                shm->group_list[shm->group_count].size = group_size;
+                memcpy(shm->group_list[shm->group_count].user_ids, group_users, sizeof(group_users[0]) * group_size);
+                strcpy(shm->group_list[shm->group_count].name, group_name);
+                shm->group_count++;
+
+                size += snprintf(reply + size, 1024 - size, "group %s created with %d users:", group_name, group_size);
+                size += snprintf(reply + size, 1024 - size, " %s", shm->user_list[group_users[0]].name);
+                for (int i = 1; i < group_size; i++)
+                    size += snprintf(reply + size, 1024 - size, ", %s", shm->user_list[group_users[i]].name);
+                size += snprintf(reply + size, 1024 - size, "\n");
+            }
+        } else if (!strcmp(buffer, "listg")) {
+            const int group_count = shm->group_count;
+
+            for (int i = 0; i < group_count; i++) {
+                bool part_of_group = false;
+                for (int j = 0; j < shm->group_list[i].size; j++) {
+                    if (conn->user_index == shm->group_list[i].user_ids[j]) {
+                        part_of_group = true;
+                        break;
+                    }
+                }
+                if (part_of_group) {
+                    size += snprintf(reply + size, 1024 - size, "%3d. %10s:", i+1, shm->group_list[i].name);
+                    for (int j = 0; j < shm->group_list[i].size; j++)
+                        size += snprintf(reply + size, 1024 - size, " %s", shm->user_list[shm->group_list[i].user_ids[j]].name);
+                    size += snprintf(reply + size, 1024 - size, "\n");
+                }
+            }
+        } else if (!strncmp(buffer, "msgg ", 5)) {
+            int r;
+            for (r = 5; r < strlen(buffer); r++)
+                if (buffer[r] == ' ')
+                    break;
+            if (r == 5 || r == strlen(buffer))
+                goto unknown_cmd;
+
+            char target_group_name[r - 5 + 1];
+            memcpy(target_group_name, buffer + 5, r - 5);
+            target_group_name[r - 5] = '\0';
+            
+            const int group_count = shm->group_count;
+            int target_group_index;
+            for (target_group_index = 0; target_group_index < group_count; target_group_index++) {
+                if (!strcmp(shm->group_list[target_group_index].name, target_group_name))
+                    break;
+            }
+            if (target_group_index == group_count) {
+                size += snprintf(reply + size, 1024 - size, "group `%s` not found\n", target_group_name);
+            } else {
+                bool part_of_group = false;
+                for (int j = 0; j < shm->group_list[target_group_index].size; j++) {
+                    if (conn->user_index == shm->group_list[target_group_index].user_ids[j]) {
+                        part_of_group = true;
+                        break;
+                    }
+                }
+
+                if (!part_of_group) {
+                    size += snprintf(reply + size, 1024 - size, "you are not part of group %s!\n", target_group_name);
+                } else {
+                    char msg_buffer[2048] = { '\r' };
+                    int mtext_len = 1;
+
+                    mtext_len += snprintf(msg_buffer + mtext_len, 2048 - mtext_len, "FROM %s ON GROUP %s: %s\n", shm->user_list[conn->user_index].name, target_group_name,  buffer + r + 1);
+
+                    for (int i = 0; i < shm->group_list[target_group_index].size; i++)
+                        if (shm->group_list[target_group_index].user_ids[i] != conn->user_index)
+                            send_message_to(shm->group_list[target_group_index].user_ids[i], msg_buffer);
+
+                    size += snprintf(reply + size, 1024 - size, "message sent to %s\n", target_group_name);
+                }
+            }
         } else {
         unknown_cmd:;
             const char msg_unknown[] = "Unknown command. Enter `help` to see a list of supported commands.\n";
@@ -270,7 +391,7 @@ bool recv_from_connection(struct connection *conn) {
 
 void send_to_connection(struct connection *conn) {
     char buffer[8192] = { 0 };
-    // TODO: can fail with EAGAIN if there are too many messages
+    // can fail with EAGAIN if there are too many messages
     mq_receive(conn->msg_queue_fd, buffer, 8192, NULL);
     strcat(buffer, shm->user_list[conn->user_index].name);
     strcat(buffer, "> ");
@@ -324,7 +445,7 @@ void execute_child(int c_sock_fd) {
         if (new_conn_fd != -1) {
             connections[connection_count++] = (struct connection) { .conn_fd = new_conn_fd, .user_index = -1 };
 
-            const char msg_enter_username[] = "Enter username (limit of %d characters): ";
+            const char msg_enter_username[] = "Enter username (limit of %d characters, no spaces): ";
             const int buffer_capacity = strlen(msg_enter_username) + 8; // just some wiggle room is limit is long
             char buffer[buffer_capacity];
             memset(buffer, '\0', buffer_capacity);
@@ -371,6 +492,16 @@ int main(void) {
     struct sigaction sa = { .sa_handler = SIG_DFL, .sa_mask = block_sigchld, .sa_flags = SA_NOCLDWAIT };
     sigaction(SIGCHLD, &sa, NULL);
 
+    int socket_fd;
+    {
+        const struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_ANY), .sin_port = htons(TCP_LISTENING_PORT) };
+        socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+        int retval = bind(socket_fd, (const struct sockaddr *) &addr, sizeof addr);
+
+        if (retval == -1)
+            error_and_exit("bind failure");
+    }
+
     shm = mmap(NULL, sizeof *shm, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     {
         pthread_mutexattr_t mattr;
@@ -402,15 +533,6 @@ int main(void) {
 
     // c_sock_fd cannot be closed yet, as it will be needed when creating new children
 
-    int socket_fd;
-    {
-        const struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_ANY), .sin_port = htons(TCP_LISTENING_PORT) };
-        socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-        int retval = bind(socket_fd, (const struct sockaddr *) &addr, sizeof addr);
-
-        if (retval == -1) // TODO: fix - exiting leaves children alive
-            error_and_exit("bind failure");
-    }
     listen(socket_fd, TCP_BACKLOG_LEN);
 
     const int nfds = (socket_fd > p_sock_fd ? socket_fd : p_sock_fd) + 1;
